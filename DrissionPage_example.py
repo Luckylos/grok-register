@@ -139,8 +139,13 @@ DEFAULT_SSO_FILE = os.path.join(_sso_dir, f"sso_{_sso_ts}.txt")
 
 
 def start_browser():
-    # 每轮从全新浏览器开始，降低长时间复用带来的页面与 Cookie 污染。
+    # 每轮从全新浏览器开始，清理用户数据目录避免旧 Cookie 污染（尤其是 sso cookie 持久化问题）。
     global browser, page
+    import shutil as _shutil
+    _user_data = os.path.join(os.path.dirname(__file__), "chrome_data")
+    if os.path.isdir(_user_data):
+        _shutil.rmtree(_user_data, ignore_errors=True)
+    os.makedirs(_user_data, exist_ok=True)
     browser = Chromium(co)
     tabs = browser.get_tabs()
     page = tabs[-1] if tabs else browser.new_tab()
