@@ -1,2 +1,11 @@
-DrissionPage==4.1.0.9
+# 浏览器自动化
+DrissionPage>=4.1.0
+
+# HTTP 请求（TLS 指纹伪装，CloudMail API 必需）
 curl_cffi>=0.7.0
+
+# 标准 HTTP 请求（grok2api 推送回退、CloudMail API 回退）
+requests>=2.28.0
+
+# 无头服务器 Xvfb 虚拟显示器（Linux 可选）
+PyVirtualDisplay>=3.0

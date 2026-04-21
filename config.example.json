@@ -1,14 +1,17 @@
 {
-    "run": {
-        "count": 10
-    },
-    "duckmail_api_base": "https://api.duckmail.sbs",
-    "duckmail_bearer": "<your_duckmail_bearer_token>",
-    "proxy": "",
-    "browser_proxy": "",
-    "api": {
-        "endpoint": "",
-        "token": "",
-        "append": true
-    }
+  "run": {
+    "count": 10
+  },
+  "cloudmail_api_base": "https://your-cloudmail-domain.com",
+  "cloudmail_public_token": "",
+  "cloudmail_email_domain": "your-domain.com",
+  "cloudmail_admin_email": "admin@your-domain.com",
+  "cloudmail_admin_password": "",
+  "proxy": "",
+  "browser_proxy": "",
+  "api": {
+    "endpoint": "",
+    "token": "",
+    "append": true
+  }
 }

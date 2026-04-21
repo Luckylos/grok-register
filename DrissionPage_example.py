@@ -84,7 +84,7 @@ if not os.environ.get("DISPLAY") or os.environ.get("USE_XVFB") == "1":
         print(f"[Warn] Xvfb 启动失败: {e}，将尝试直接运行")
 
 co = ChromiumOptions()
-co.auto_port()
+co.set_local_port(9222)
 co.set_argument("--no-sandbox")
 co.set_argument("--disable-gpu")
 co.set_argument("--disable-dev-shm-usage")
