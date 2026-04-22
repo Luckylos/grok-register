@@ -1300,8 +1300,8 @@ def append_sso_to_txt(sso_value, output_path=DEFAULT_SSO_FILE):
 
 def push_sso_to_api(new_tokens: list):
     # 推送 SSO token 到 grok2api 管理接口。
-    # append=false：直接将本次 token 列表全量推送（覆盖）。
-    # append=true（默认）：先 GET 查询线上现有 token，合并本次后全量推送。
+    # 使用 /admin/api/tokens GET 查询现有 token（去重），
+    # 再用 /admin/api/tokens/add POST 逐个添加新 token。
     import json
     import urllib3
     import requests
@@ -1318,7 +1318,6 @@ def push_sso_to_api(new_tokens: list):
     api_conf = conf.get("api", {})
     endpoint = str(api_conf.get("endpoint", "")).strip()
     api_token = str(api_conf.get("token", "")).strip()
-    append_mode = api_conf.get("append", True)
 
     if not endpoint or not api_token:
         return
@@ -1328,54 +1327,58 @@ def push_sso_to_api(new_tokens: list):
         "Content-Type": "application/json",
     }
 
-    tokens_to_push = [t for t in new_tokens if t]
+    # 从 endpoint 推导出查询 URL（将 /add 替换为空即得到列表端点）
+    # e.g. http://127.0.0.1:8000/admin/api/tokens/add → http://127.0.0.1:8000/admin/api/tokens
+    list_endpoint = endpoint.rstrip("/").replace("/add", "")
 
-    if append_mode:
-        try:
-            get_resp = requests.get(endpoint, headers=headers, timeout=15, verify=False)
-            if get_resp.status_code == 200:
-                data = get_resp.json()
-                # 兼容两种响应格式：
-                # 新版: {"tokens": {"ssoBasic": [...]}}
-                # 旧版: {"ssoBasic": [...]}
-                if isinstance(data, dict) and isinstance(data.get("tokens"), dict):
-                    existing = data["tokens"].get("ssoBasic", [])
-                else:
-                    existing = data.get("ssoBasic", []) if isinstance(data, dict) else []
-                existing_tokens = [
-                    item["token"] if isinstance(item, dict) else str(item)
-                    for item in existing if item
-                ]
-                seen = set()
-                deduped = []
-                for t in existing_tokens + tokens_to_push:
-                    if t not in seen:
-                        seen.add(t)
-                        deduped.append(t)
-                tokens_to_push = deduped
-                print(f"[*] 查询到线上 {len(existing_tokens)} 个 token，合并本次 {len(new_tokens)} 个，共 {len(deduped)} 个")
-            else:
-                print(f"[Error] 查询线上 token 失败: HTTP {get_resp.status_code}，放弃推送以保护存量数据")
-                return
-        except Exception as e:
-            print(f"[Error] 查询线上 token 异常: {e}，放弃推送以保护存量数据")
-            return
+    # 过滤空 token
+    tokens_to_push = [t.strip() for t in new_tokens if t and t.strip()]
+    if not tokens_to_push:
+        print("[Info] 没有新 token 需要推送")
+        return
 
+    # 查询线上已有 token，过滤掉已存在的，避免重复添加
+    existing_tokens = set()
+    try:
+        get_resp = requests.get(list_endpoint, headers=headers, timeout=15, verify=False)
+        if get_resp.status_code == 200:
+            data = get_resp.json()
+            # grok2api 返回格式: {"tokens": [{"token": "xxx", "pool": "basic", ...}, ...]}
+            token_list = data.get("tokens", []) if isinstance(data, dict) else []
+            for item in token_list:
+                if isinstance(item, dict):
+                    existing_tokens.add(item.get("token", ""))
+                elif isinstance(item, str):
+                    existing_tokens.add(item)
+            print(f"[API] 线上已有 {len(existing_tokens)} 个 token")
+        else:
+            print(f"[Warn] 查询线上 token 失败: HTTP {get_resp.status_code}，仍尝试推送新 token")
+    except Exception as e:
+        print(f"[Warn] 查询线上 token 异常: {e}，仍尝试推送新 token")
+
+    # 只推送线上不存在的新 token
+    new_only = [t for t in tokens_to_push if t not in existing_tokens]
+    if not new_only:
+        print(f"[API] {len(tokens_to_push)} 个 token 已全部存在于线上，无需推送")
+        return
+
+    # 使用 /admin/api/tokens/add 端点逐个推送
+    # API 格式: POST {"tokens": ["sso1", "sso2"], "pool": "basic"}
+    pool_name = api_conf.get("pool", "basic")
     try:
         resp = requests.post(
             endpoint,
-            json={"ssoBasic": tokens_to_push},
+            json={"tokens": new_only, "pool": pool_name},
             headers=headers,
             timeout=60,
             verify=False,
         )
         if resp.status_code == 200:
-            print(f"[*] SSO token 已推送到 API（共 {len(tokens_to_push)} 个）: {endpoint}")
+            print(f"[API] 已推送 {len(new_only)} 个新 token 到 grok2api（pool={pool_name}）")
         else:
             print(f"[Warn] 推送 API 返回异常: HTTP {resp.status_code} {resp.text[:200]}")
     except Exception as e:
         print(f"[Warn] 推送 API 失败: {e}")
-
 
 def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False):
     # 单轮流程：打开注册页 -> 完成注册 -> 获取 sso -> 写 txt。
