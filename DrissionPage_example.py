@@ -2,6 +2,7 @@ from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 import argparse
 import shutil
+import signal
 import tempfile
 import datetime
 import logging
@@ -74,14 +75,96 @@ warn_runtime_compatibility()
 
 # 无头服务器自动启用 Xvfb 虚拟显示器
 _virtual_display = None
-if not os.environ.get("DISPLAY") or os.environ.get("USE_XVFB") == "1":
+_xvfb_pid = None  # 跟踪 Xvfb 子进程 PID，用于精确清理
+
+
+def _start_virtual_display():
+    """启动 Xvfb 虚拟显示器，记录 PID"""
+    global _virtual_display, _xvfb_pid
+    if os.environ.get("DISPLAY") and os.environ.get("USE_XVFB") != "1":
+        return  # 已有显示器且未强制 Xvfb，跳过
     try:
         from pyvirtualdisplay import Display
         _virtual_display = Display(visible=0, size=(1920, 1080))
         _virtual_display.start()
-        print(f"[*] Xvfb 虚拟显示器已启动: {os.environ.get('DISPLAY')}")
+        # pyvirtualdisplay 内部通过 subprocess 启动 Xvfb，尝试获取其 PID
+        if hasattr(_virtual_display, "process") and _virtual_display.process:
+            _xvfb_pid = _virtual_display.process.pid
+        elif hasattr(_virtual_display, "_proc") and _virtual_display._proc:
+            _xvfb_pid = _virtual_display._proc.pid
+        print(f"[*] Xvfb 虚拟显示器已启动: {os.environ.get('DISPLAY')} (PID={_xvfb_pid})")
     except Exception as e:
         print(f"[Warn] Xvfb 启动失败: {e}，将尝试直接运行")
+
+
+def _stop_virtual_display():
+    """安全关闭 Xvfb 虚拟显示器，确保进程被回收"""
+    global _virtual_display, _xvfb_pid
+    if _virtual_display is not None:
+        try:
+            _virtual_display.stop()
+        except Exception:
+            pass
+        _virtual_display = None
+    # 二次确认：如果 Xvfb PID 仍存活，强制 kill
+    if _xvfb_pid:
+        try:
+            import subprocess as _sp
+            result = _sp.run(["kill", "-0", str(_xvfb_pid)],
+                             capture_output=True, timeout=3)
+            if result.returncode == 0:
+                _sp.run(["kill", "-9", str(_xvfb_pid)],
+                        capture_output=True, timeout=3)
+                print(f"[Cleanup] 强制终止残留 Xvfb PID={_xvfb_pid}")
+        except Exception:
+            pass
+        _xvfb_pid = None
+    _cleanup_orphan_xvfb()
+
+
+def _cleanup_orphan_xvfb():
+    """清理所有孤立的 Xvfb 进程（父PID=1 被init接管的孤儿）"""
+    import subprocess as _sp
+    try:
+        result = _sp.run(["pgrep", "-f", "Xvfb"],
+                         capture_output=True, text=True, timeout=5)
+        pids = result.stdout.strip().split('\n') if result.stdout.strip() else []
+        if not pids or pids == ['']:
+            return
+        killed = 0
+        for pid_str in pids:
+            pid_str = pid_str.strip()
+            if not pid_str.isdigit():
+                continue
+            pid = int(pid_str)
+            try:
+                ppid_result = _sp.run(["ps", "-o", "ppid=", "-p", str(pid)],
+                                      capture_output=True, text=True, timeout=3)
+                ppid = ppid_result.stdout.strip()
+                if ppid == "1" or ppid == "":
+                    _sp.run(["kill", "-9", str(pid)],
+                            capture_output=True, timeout=3)
+                    killed += 1
+            except Exception:
+                pass
+        if killed:
+            print(f"[Cleanup] 清理了 {killed} 个孤立 Xvfb 进程")
+    except Exception:
+        pass
+
+
+def _full_cleanup():
+    """完整资源清理：浏览器 + Xvfb + 临时目录，供 atexit 和信号处理调用"""
+    stop_browser()
+    _stop_virtual_display()
+
+
+_start_virtual_display()
+
+# 注册 atexit 确保进程退出时一定清理资源
+import atexit
+atexit.register(_full_cleanup)
+
 
 co = ChromiumOptions()
 co.set_local_port(9222)
@@ -128,6 +211,8 @@ EXTENSION_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "turnst
 co.add_extension(EXTENSION_PATH)
 
 _chrome_temp_dir: str = ""
+_chrome_pid: int = 0  # 跟踪当前 Chrome 主进程 PID
+_browser_debug_port: int = 0  # 跟踪当前使用的调试端口
 browser = None
 page = None
 
@@ -138,30 +223,180 @@ _sso_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 DEFAULT_SSO_FILE = os.path.join(_sso_dir, f"sso_{_sso_ts}.txt")
 
 
+def _find_free_port() -> int:
+    """查找一个空闲的调试端口，避免端口冲突导致启动失败"""
+    import socket
+    for port in range(9222, 9332):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1)
+                s.connect(("127.0.0.1", port))
+                # 端口被占用，尝试下一个
+        except (ConnectionRefusedError, OSError):
+            return port
+    return 9222
+
+
+def _kill_port_owner(port: int):
+    """强制终止占用指定端口的进程"""
+    import subprocess as _sp
+    try:
+        result = _sp.run(["lsof", "-ti", f":{port}"],
+                         capture_output=True, text=True, timeout=5)
+        pids = result.stdout.strip().split('\n') if result.stdout.strip() else []
+        for pid_str in pids:
+            pid_str = pid_str.strip()
+            if pid_str.isdigit():
+                _sp.run(["kill", "-9", str(pid_str)],
+                        capture_output=True, timeout=3)
+                print(f"[Cleanup] 终止占用端口 {port} 的进程 PID={pid_str}")
+    except Exception:
+        pass
+
+
+def _ensure_chrome_dead(pid: int, timeout: int = 5):
+    """确保指定 Chrome 进程及其子进程树已完全退出"""
+    import subprocess as _sp
+    if not pid:
+        return
+    # 先尝试优雅终止
+    try:
+        _sp.run(["kill", str(pid)], capture_output=True, timeout=3)
+    except Exception:
+        pass
+    # 等待进程退出
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            result = _sp.run(["kill", "-0", str(pid)],
+                             capture_output=True, timeout=2)
+            if result.returncode != 0:
+                return  # 进程已退出
+        except Exception:
+            return
+        time.sleep(0.5)
+    # 超时后强杀进程树
+    try:
+        _sp.run(["kill", "-9", str(pid)], capture_output=True, timeout=3)
+        print(f"[Cleanup] 强制终止 Chrome PID={pid}")
+    except Exception:
+        pass
+    try:
+        result = _sp.run(["pgrep", "-P", str(pid)],
+                         capture_output=True, text=True, timeout=3)
+        child_pids = result.stdout.strip().split('\n') if result.stdout.strip() else []
+        for cpid_str in child_pids:
+            cpid_str = cpid_str.strip()
+            if cpid_str.isdigit():
+                _sp.run(["kill", "-9", str(cpid_str)],
+                        capture_output=True, timeout=3)
+    except Exception:
+        pass
+
+
 def start_browser():
     # 每轮从全新浏览器开始，使用独立临时 profile 目录避免 Cookie/Session 复用。
-    global browser, page, _chrome_temp_dir
+    global browser, page, _chrome_temp_dir, _chrome_pid, _browser_debug_port
+
+    # 启动前确保上轮资源已完全清理
+    if _chrome_pid:
+        _ensure_chrome_dead(_chrome_pid)
+        _chrome_pid = 0
+
+    # 查找空闲调试端口
+    debug_port = _find_free_port()
+    if debug_port != 9222:
+        # 端口 9222 被占用，先清理并等待释放
+        _kill_port_owner(9222)
+        time.sleep(1)  # 等待端口释放
+        debug_port = 9222
+
+    # 二次确认：确保9222端口可用
+    for _ in range(3):
+        import socket as _sock
+        try:
+            with _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM) as s:
+                s.settimeout(1)
+                s.connect(("127.0.0.1", 9222))
+                # 端口仍被占用，强制清理再等
+                _kill_port_owner(9222)
+                time.sleep(2)
+        except (ConnectionRefusedError, OSError):
+            break  # 端口空闲，可以启动
+
+    co.set_local_port(debug_port)
+    _browser_debug_port = debug_port
+
     _chrome_temp_dir = tempfile.mkdtemp(prefix="chrome_run_")
     co.set_user_data_path(_chrome_temp_dir)
-    browser = Chromium(co)
-    tabs = browser.get_tabs()
-    page = tabs[-1] if tabs else browser.new_tab()
+    try:
+        browser = Chromium(co)
+        tabs = browser.get_tabs()
+        page = tabs[-1] if tabs else browser.new_tab()
+        # 记录 Chrome 主进程 PID
+        try:
+            _chrome_pid = browser.process_id if hasattr(browser, 'process_id') else 0
+        except Exception:
+            _chrome_pid = 0
+        # 备用方式：通过端口查找 PID
+        if not _chrome_pid:
+            try:
+                import subprocess as _sp
+                r = _sp.run(["lsof", "-ti", f":{debug_port}"],
+                            capture_output=True, text=True, timeout=5)
+                pids = r.stdout.strip().split('\n')
+                if pids and pids[0].strip().isdigit():
+                    _chrome_pid = int(pids[0].strip())
+            except Exception:
+                pass
+        print(f"[Browser] 启动成功 (port={debug_port}, PID={_chrome_pid}, dir={os.path.basename(_chrome_temp_dir)})")
+    except Exception as e:
+        print(f"[Error] 浏览器启动失败: {e}")
+        _chrome_pid = 0
+        browser = None
+        page = None
+        raise
     return browser, page
 
 
 def stop_browser():
-    # 完整关闭整个浏览器实例，并清理本轮临时 profile，供下一轮重新拉起。
-    global browser, page, _chrome_temp_dir
+    # 完整关闭整个浏览器实例，并清理本轮临时 profile。
+    global browser, page, _chrome_temp_dir, _chrome_pid, _browser_debug_port
+    # 第一步：通过 API 优雅关闭
     if browser is not None:
         try:
             browser.quit()
         except Exception:
             pass
-    browser = None
-    page = None
+        browser = None
+        page = None
+
+    # 第二步：基于 PID 精确清理
+    if _chrome_pid:
+        _ensure_chrome_dead(_chrome_pid, timeout=5)
+        _chrome_pid = 0
+
+    # 第三步：兜底 - 清理占用当前调试端口的残留进程
+    if _browser_debug_port:
+        _kill_port_owner(_browser_debug_port)
+        _browser_debug_port = 0
+
+    # 第四步：清理当前轮临时目录
     if _chrome_temp_dir and os.path.isdir(_chrome_temp_dir):
         shutil.rmtree(_chrome_temp_dir, ignore_errors=True)
-    _chrome_temp_dir = ""
+        _chrome_temp_dir = ""
+
+    # 第五步：安全清理旧临时目录（仅清理超过5分钟的，避免误删正在使用的）
+    try:
+        for old_dir in glob.glob("/tmp/chrome_run_*"):
+            try:
+                dir_mtime = os.path.getmtime(old_dir)
+                if time.time() - dir_mtime > 300:
+                    shutil.rmtree(old_dir, ignore_errors=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def restart_browser():
@@ -178,6 +413,9 @@ def restart_browser():
     except Exception:
         stop_browser()
         start_browser()
+
+
+
 
 
 def refresh_active_page():
@@ -1190,6 +1428,17 @@ def main():
     global run_logger
     run_logger = setup_run_logger()
 
+    # 信号处理：确保被 kill / SSH断连 时也能完整清理所有资源
+    def _cleanup_on_signal(signum, frame):
+        sig_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
+        print(f"\n[Info] 收到信号 {sig_name}({signum})，正在清理所有资源...")
+        _full_cleanup()
+        sys.exit(1)
+
+    signal.signal(signal.SIGTERM, _cleanup_on_signal)
+    signal.signal(signal.SIGINT, _cleanup_on_signal)
+    signal.signal(signal.SIGHUP, _cleanup_on_signal)  # SSH 断连时清理
+
     config_count = load_run_count()
 
     parser = argparse.ArgumentParser(description="xAI 自动注册并采集 sso")
@@ -1200,6 +1449,9 @@ def main():
 
     current_round = 0
     collected_sso: list = []
+    consecutive_failures = 0  # 连续失败计数
+    MAX_CONSECUTIVE_FAILURES = 5  # 连续失败上限，超过后暂停
+
     try:
         start_browser()
         while True:
@@ -1208,30 +1460,52 @@ def main():
 
             current_round += 1
             print(f"\n[*] 开始第 {current_round} 轮注册")
-            round_succeeded = False
 
             try:
                 result = run_single_registration(args.output, extract_numbers=args.extract_numbers)
                 collected_sso.append(result["sso"])
-                round_succeeded = True
+                consecutive_failures = 0  # 成功则重置
+                # 每轮注册成功后立即推送到 grok2api
+                print(f"\n[*] 立即推送第 {current_round} 轮 token 到 API...")
+                push_sso_to_api([result["sso"]])
             except KeyboardInterrupt:
                 print("\n[Info] 收到中断信号，停止后续轮次。")
                 break
             except Exception as error:
+                consecutive_failures += 1
                 print(f"[Error] 第 {current_round} 轮失败: {error}")
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    print(f"[Warn] 连续 {consecutive_failures} 轮失败，暂停 60 秒后重试...")
+                    time.sleep(60)
+                    consecutive_failures = 0
             finally:
-                restart_browser()
+                # 每轮彻底关闭浏览器再重启，避免 Chrome 进程残留
+                try:
+                    stop_browser()
+                except Exception as e:
+                    print(f"[Warn] stop_browser 异常: {e}")
+                try:
+                    start_browser()
+                except Exception as e:
+                    print(f"[Error] start_browser 失败: {e}，等待 10 秒后重试...")
+                    time.sleep(10)
+                    try:
+                        start_browser()
+                    except Exception:
+                        print(f"[Fatal] 浏览器无法启动，终止运行")
+                        break
 
             if args.count == 0 or current_round < args.count:
                 time.sleep(2)
 
     finally:
         if collected_sso:
-            print(f"\n[*] 注册完成，推送 {len(collected_sso)} 个 token 到 API...")
-            push_sso_to_api(collected_sso)
+            print(f"\n[*] 全部完成，共注册 {len(collected_sso)} 个账户（已实时推送）")
 
         stop_browser()
+        # Xvfb 的清理由 atexit.register(_full_cleanup) 保证
 
 
 if __name__ == "__main__":
     main()
+

@@ -122,10 +122,14 @@ def _create_session():
 
 
 def _do_request(session, use_cffi, method, url, **kwargs):
-    """统一请求，curl_cffi 加 impersonate 参数"""
+    """统一请求，curl_cffi 加 impersonate 参数，跳过自签证书验证"""
     if use_cffi:
         kwargs.setdefault("impersonate", "chrome131")
-    return getattr(session, method)(url, **kwargs)
+        kwargs.setdefault("verify", False)
+        return getattr(session, method)(url, **kwargs)
+    else:
+        kwargs.setdefault("verify", False)
+        return getattr(session, method)(url, **kwargs)
 
 
 def _generate_password(length=14):
