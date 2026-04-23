@@ -1,0 +1,18 @@
+services:
+  grok-register:
+    build: .
+    container_name: grok-register
+    restart: "no"
+    # Run once then exit; use external cron (or deploy with restart policy)
+    environment:
+      - TZ=Asia/Shanghai
+      - DISPLAY=:99
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./logs:/app/logs
+      - ./sso:/app/sso
+    # Use host network so browser_proxy (127.0.0.1:7777) and
+    # grok2api (127.0.0.1:8000) are reachable as-is
+    network_mode: host

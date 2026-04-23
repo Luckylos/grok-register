@@ -180,6 +180,12 @@ co.set_argument("--no-sandbox")
 co.set_argument("--disable-gpu")
 co.set_argument("--disable-dev-shm-usage")
 co.set_argument("--disable-software-rasterizer")
+# Turnstile 反检测参数
+co.set_argument("--disable-blink-features=AutomationControlled")
+co.set_argument("--disable-features=AutomationControlled")
+co.set_argument("--disable-infobars")
+co.set_argument("--window-size=1920,1080")
+co.set_argument("--lang=en-US,en;q=0.9")
 
 # 从 config.json 读取代理配置给浏览器
 _browser_proxy = ""
@@ -266,6 +272,16 @@ def start_browser():
 			except Exception:
 				pass
 		logger.info(f"[Browser] 启动成功 (port={debug_port}, PID={_chrome_pid}, dir={os.path.basename(_chrome_temp_dir)})")
+		# 注入反自动化检测脚本
+		try:
+			page.run_js("""
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+window.chrome = { runtime: {} };
+""")
+		except Exception:
+			pass
 	except Exception as e:
 		logger.error(f"浏览器启动失败: {e}")
 		_chrome_pid = 0

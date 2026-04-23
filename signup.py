@@ -3,6 +3,7 @@
 
 import secrets
 import time
+import random
 
 from DrissionPage.errors import PageDisconnectedError
 
@@ -444,43 +445,179 @@ return { url: location.href, inputs, buttons };
 	raise Exception("未找到验证码输入框或确认邮箱按钮")
 
 
-def getTurnstileToken(total_timeout=30):
-	"""获取 Turnstile token，增加总超时控制（默认 30s）"""
-	browser.page.run_js("try { turnstile.reset() } catch(e) { }")
+def getTurnstileToken(total_timeout=90):
+	"""获取 Turnstile token — CDP 点击 + 多种轮询 + 详细日志
 
+	实际诊断结果: Turnstile iframe 不在 shadow DOM 中，直接作为 .cf-turnstile 的子元素。
+	M3 的 shadow_root 方法不适用。改用 JS 直接定位 iframe 并 CDP dispatch 点击。
+	"""
+	# 不要 reset — 让 Turnstile 自然运行
 	deadline = time.time() + total_timeout
-	turnstileResponse = None
+	attempt = 0
 
 	while time.time() < deadline:
+		attempt += 1
+		elapsed = int(time.time() - (deadline - total_timeout))
+
+		# M1: turnstile.getResponse() API — 最直接
 		try:
 			turnstileResponse = browser.page.run_js("try { return turnstile.getResponse() } catch(e) { return null }")
 			if turnstileResponse:
+				logger.info(f"[Turnstile] M1-getResponse成功 (#{attempt}, {elapsed}s)")
 				return turnstileResponse
-
-			challengeSolution = browser.page.ele("@name=cf-turnstile-response")
-			challengeWrapper = challengeSolution.parent()
-			challengeIframe = challengeWrapper.shadow_root.ele("tag:iframe")
-
-			challengeIframe.run_js("""
-window.dtp = 1
-function getRandomInt(min, max) {
-	return Math.floor(Math.random() * (max - min + 1)) + min;
-}
-
-let screenX = getRandomInt(800, 1200);
-let screenY = getRandomInt(400, 600);
-
-Object.defineProperty(MouseEvent.prototype, 'screenX', { value: screenX });
-Object.defineProperty(MouseEvent.prototype, 'screenY', { value: screenY });
-						""")
-
-			challengeIframeBody = challengeIframe.ele("tag:body").shadow_root
-			challengeButton = challengeIframeBody.ele("tag:input")
-			challengeButton.click()
-		except:
+		except Exception:
 			pass
-		time.sleep(1)
 
+		# M2: 直接读 input 值
+		try:
+			direct_val = browser.page.run_js("""
+const inp = document.querySelector('input[name="cf-turnstile-response"]');
+return inp ? (inp.value || null) : null;
+""")
+			if direct_val:
+				logger.info(f"[Turnstile] M2-input值成功 (#{attempt}, {elapsed}s)")
+				return direct_val
+		except Exception:
+			pass
+
+		# 诊断: 每10次或第3次
+		if attempt == 3 or attempt % 10 == 0:
+			try:
+				_diag = browser.page.run_js("""
+const inp = document.querySelector('input[name="cf-turnstile-response"]');
+const cfDiv = document.querySelector('.cf-turnstile');
+// 扩大搜索范围 — 检查多种可能的容器
+const altContainers = document.querySelectorAll('[data-sitekey], [class*="turnstile"], [class*="cf-"], [id*="turnstile"], [id*="cf-"]');
+let containerInfo = [];
+altContainers.forEach(el => {
+	containerInfo.push({
+		tag: el.tagName,
+		cls: (el.className || '').toString().substring(0, 50),
+		id: (el.id || '').substring(0, 30),
+		children: el.children.length,
+		visible: el.offsetWidth > 0
+	});
+});
+// 检查 Turnstile 脚本是否加载
+const scripts = document.querySelectorAll('script[src*="turnstile"], script[src*="challenges.cloudflare"]');
+let scriptInfo = [];
+scripts.forEach(s => scriptInfo.push(s.src.substring(0, 80)));
+const allIframes = document.querySelectorAll('iframe');
+let turnstileIframes = [];
+allIframes.forEach(ifr => {
+	const src = ifr.src || '';
+	if (src.includes('turnstile') || src.includes('challenges.cloudflare') || src.includes('captcha')) {
+		turnstileIframes.push({ src: src.substring(0, 80), size: ifr.offsetWidth + 'x' + ifr.offsetHeight, visible: ifr.offsetWidth > 0 });
+	}
+});
+// 查找 input 的父级结构
+let parentInfo = '';
+if (inp) {
+	let p = inp.parentElement;
+	const chain = [];
+	while (p && chain.length < 5) {
+		chain.push(p.tagName + (p.className ? '.' + p.className.toString().split(' ')[0] : '') + (p.id ? '#' + p.id : ''));
+		p = p.parentElement;
+	}
+	parentInfo = chain.join(' > ');
+}
+// 检查 turnstile JS 全局变量
+const hasTurnstileJS = typeof turnstile !== 'undefined';
+const hasTurnstileObj = hasTurnstileJS ? Object.keys(turnstile).join(',') : 'none';
+return {
+	inputExists: !!inp,
+	inputValue: inp ? (inp.value || '').substring(0, 20) : null,
+	cfDivExists: !!cfDiv,
+	parentChain: parentInfo,
+	containersFound: containerInfo.slice(0, 5),
+	turnstileIframes: turnstileIframes,
+	scriptsLoaded: scriptInfo,
+	totalIframes: allIframes.length,
+	hasTurnstileJS: hasTurnstileJS,
+	turnstileMethods: hasTurnstileObj
+};
+""")
+				logger.info(f"[Turnstile] 诊断#{attempt} ({elapsed}s): input={_diag.get('inputExists')}, val={_diag.get('inputValue')}, cfDiv={_diag.get('cfDivExists')}, parent={_diag.get('parentChain')}, iframes={_diag.get('turnstileIframes')}, scripts={_diag.get('scriptsLoaded')}, turnstileJS={_diag.get('hasTurnstileJS')}({(_diag.get('turnstileMethods') or '')[:50]})")
+			except Exception as e:
+				logger.debug(f"[Turnstile] 诊断失败: {e}")
+
+		# M3: JS 直接在 .cf-turnstile iframe 上 dispatch 真人化点击
+		# 不用 DrissionPage 的 shadow_root API — iframe 不是在 shadow DOM 里
+		if attempt % 3 == 1:
+			try:
+				click_result = browser.page.run_js("""
+const cfDiv = document.querySelector('.cf-turnstile');
+if (!cfDiv) return 'no-cf-div';
+const ifr = cfDiv.querySelector('iframe');
+if (!ifr) return 'no-iframe';
+
+// 获取 iframe 位置用于坐标点击
+const rect = ifr.getBoundingClientRect();
+if (rect.width === 0 || rect.height === 0) return 'iframe-hidden:' + rect.width + 'x' + rect.height;
+
+// 在 iframe 中心区域派发鼠标事件（模拟真人点击 checkbox 区域）
+const centerX = rect.left + rect.width * 0.15;
+const centerY = rect.top + rect.height * 0.5;
+
+// 派发完整的鼠标事件链
+['mousedown', 'mouseup', 'click'].forEach(type => {
+	const evt = new MouseEvent(type, {
+		bubbles: true, cancelable: true,
+		view: window,
+		screenX: centerX + Math.random() * 10,
+		screenY: centerY + Math.random() * 10,
+		clientX: centerX, clientY: centerY,
+		button: 0
+	});
+	ifr.dispatchEvent(evt);
+});
+
+return 'clicked:' + Math.round(rect.width) + 'x' + Math.round(rect.height);
+""")
+				logger.debug(f"[Turnstile] M3-JS点击 (#{attempt}, {elapsed}s): {click_result}")
+			except Exception as e:
+				logger.debug(f"[Turnstile] M3-JS点击失败: {e}")
+
+		# M4: 通过 CDP Input.dispatchMouseEvent 直接发送底层鼠标事件
+		if attempt % 3 == 2:
+			try:
+				iframe_rect = browser.page.run_js("""
+const cfDiv = document.querySelector('.cf-turnstile');
+if (!cfDiv) return null;
+const ifr = cfDiv.querySelector('iframe');
+if (!ifr) return null;
+const rect = ifr.getBoundingClientRect();
+return { x: rect.left + rect.width * 0.15, y: rect.top + rect.height * 0.5, w: rect.width, h: rect.height };
+""")
+				if iframe_rect and iframe_rect.get('w', 0) > 0:
+					x = float(iframe_rect['x'])
+					y = float(iframe_rect['y'])
+					browser.page.run_cdp("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y)
+					time.sleep(0.1)
+					browser.page.run_cdp("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y, button="left", clickCount=1)
+					time.sleep(0.05)
+					browser.page.run_cdp("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button="left", clickCount=1)
+					logger.debug(f"[Turnstile] M4-CDP点击 (#{attempt}, {elapsed}s)")
+			except Exception as e:
+				logger.debug(f"[Turnstile] M4-CDP点击失败: {e}")
+
+		# M5: 每8次 reset turnstile widget
+		if attempt % 8 == 0:
+			try:
+				browser.page.run_js("try { turnstile.reset(); } catch(e) {}")
+				logger.info(f"[Turnstile] M5-reset (#{attempt}, {elapsed}s)")
+			except Exception:
+				pass
+
+		# 等待 — 前期短后期长
+		if attempt <= 15:
+			time.sleep(1.5)
+		elif attempt <= 30:
+			time.sleep(2)
+		else:
+			time.sleep(3)
+
+	logger.warning(f"[Turnstile] 超时 ({total_timeout}s, {attempt}次)")
 	raise TimeoutError(f"Turnstile 解决超时（{total_timeout}s），未能获取 token")
 
 
@@ -735,7 +872,24 @@ return challengeInput ? String(challengeInput.value || '').trim() : 'not-found';
 
 		if clicked:
 			logger.info(f"已填写注册资料并点击完成注册: {given_name} {family_name} / {password}")
-			time.sleep(2)
+			# 等待页面跳转或检查错误
+			for _ in range(6):
+				time.sleep(2)
+				current_url = browser.page.url if browser.page else ""
+				if 'sign-up' not in current_url:
+					logger.info(f"注册页面已跳转到: {current_url}")
+					break
+				# 检查是否有错误消息
+				error_msg = browser.page.run_js("""
+const errs = document.querySelectorAll('[role="alert"], .error, [class*="error"], [class*="Error"]');
+for (const e of errs) {
+	const t = (e.innerText || e.textContent || '').trim();
+	if (t) return t.substring(0, 100);
+}
+return '';
+""")
+				if error_msg:
+					logger.warning(f"注册表单错误: {error_msg}")
 			return {
 				"given_name": given_name,
 				"family_name": family_name,

@@ -34,15 +34,21 @@ def wait_for_sso_cookie(timeout=60):
 		poll_count += 1
 		try:
 			refresh_active_page()
-			if page is None:
+			if browser.page is None:
 				time.sleep(2)
 				continue
 
-			# 每10次轮询打印一次当前URL和cookie数，方便调试
-			if poll_count % 10 == 1:
+			# 每5次轮询打印当前URL和cookie数
+			if poll_count % 5 == 1:
 				try:
 					current_url = browser.page.url if browser.page else "N/A"
-					logger.info(f"sso cookie 轮询 #{poll_count} | URL={current_url} | 已见cookie={sorted(last_seen_names)}")
+					cookie_count = 0
+					try:
+						all_cookies = browser.page.cookies(all_domains=True, all_info=True) or []
+						cookie_count = len(all_cookies)
+					except Exception:
+						pass
+					logger.info(f"sso cookie 轮询 #{poll_count} | URL={current_url} | cookies数={cookie_count}")
 				except Exception:
 					pass
 
